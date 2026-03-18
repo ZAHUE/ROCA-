@@ -1333,7 +1333,7 @@ namespace ROCAPointBot
 
                             await command.FollowupAsync($"⏳ 正在翻閱 `{targetName}` 的結訓紀錄檔案，這可能需要幾秒鐘的時間...");
 
-                            IMessage foundMessage = null;
+                            IMessage? foundMessage = null;
 
                             // 6. 往前翻找歷史訊息 (設定最多往回找 2000 筆以保護效能)
                             await foreach (var batch in channel.GetMessagesAsync(2000))
@@ -1474,17 +1474,19 @@ namespace ROCAPointBot
                             // 在背景非同步執行試算表更新，不影響 Discord 機器人的回應速度
                             _ = UpdateGoogleSheetAsync(gid);
                             // 顯示在前端頻道給大家看的訊息
+                            string originalChange = $"{(targetLog.PointsAdded > 0 ? "+" : string.Empty)}{targetLog.PointsAdded} {revertPointType}";
                             string delMsg = $" **[紀錄撤銷]** 負責人：**{command.User.Username}**\n" +
                                             $"> 成功撤銷了紀錄 #{logId}\n" +
-                                            $">  **被扣點人：{targetLog.RobloxUsername}**\n" +
-                                            $">  **已扣除：{targetLog.PointsAdded} 點**\n" +
-                                            $">  **扣除原因：{delReason}**\n" +
+                                            $">  **人員：{targetLog.RobloxUsername}**\n" +
+                                            $">  **PointType：{revertPointType}**\n" +
+                                            $">  **原紀錄變動：{originalChange}**\n" +
+                                            $">  **撤銷原因：{delReason}**\n" +
                                             $">  **目前剩餘：{currentPoints} 點**";
 
                             await command.FollowupAsync(delMsg);
 
                             // 🚨 刪除紀錄屬於敏感操作，一律視同異常並觸發 Ping 第一管理員身分組
-                            _ = BroadcastToAdminChannelsAsync(gid, $"負責人 **{command.User.Username}** 撤銷了紀錄 `#{logId}`，撤銷了 {targetLog.PointsAdded} 點的變動。\n>  人員：{targetLog.RobloxUsername}\n>  撤銷原因：{delReason}\n>  剩餘：{currentPoints}點", true);
+                            _ = BroadcastToAdminChannelsAsync(gid, $"負責人 **{command.User.Username}** 撤銷了紀錄 `#{logId}`。\n>  人員：{targetLog.RobloxUsername}\n>  PointType：{revertPointType}\n>  原紀錄變動：{originalChange}\n>  撤銷原因：{delReason}\n>  剩餘：{currentPoints}點", true);
                             break;
                         }
 
@@ -1502,14 +1504,12 @@ namespace ROCAPointBot
                             var dSb = new StringBuilder($"#  {dt:yyyy-MM-dd} 點數紀錄清單\n```text\n");
                             foreach (var l in dLogs)
                             {
-                                string idStr = $"[ID: {l.Id}]".PadRight(9);
+                                string pointType = NormalizePointType(l.PointType);
+                                string idStr = $"[{l.Id}]";
                                 string timeStr = l.Timestamp.ToString("HH:mm");
-                                string nameStr = l.RobloxUsername.PadRight(18);
-                                // 自動判斷正負號
-                                string ptsStr = (l.PointsAdded > 0 ? $"+{l.PointsAdded}" : l.PointsAdded.ToString()).PadLeft(5);
-                                string adminStr = l.AdminName.PadRight(12);
+                                string ptsStr = $"{(l.PointsAdded > 0 ? "+" : string.Empty)}{l.PointsAdded}";
 
-                                dSb.AppendLine($"{idStr} {timeStr} | {nameStr} ➔ {ptsStr} 點 | 登記: {adminStr} | 原因: {l.Reason}");
+                                dSb.AppendLine($"{idStr} {timeStr} | [{pointType}] {l.RobloxUsername} ➔ {ptsStr}點 | 登記: {l.AdminName} | 原因: {l.Reason}");
                             }
                             dSb.AppendLine("```");
                             await command.FollowupAsync(dSb.ToString());
@@ -1559,7 +1559,7 @@ namespace ROCAPointBot
                             string roleMsg = $"<@&{mndRole.Id}>";
                             if (mndRole2 != null) roleMsg += $" 及 <@&{mndRole2.Id}>";
                             await db.SaveChangesAsync();
-                            await command.FollowupAsync($"✅ **已將此頻道設為國防部推播頻道！**\n📡 授權監控的單位編號：`{codes}`\n👮 授權查詢身分組：<@&{mndRole.Id}>\n> *(擁有該身分組的長官，現在可以在此頻道使用 `/admin-view` 指令查詢各單位排行榜了！)*");
+                            await command.FollowupAsync($"✅ **已將此頻道設為國防部推播頻道！**\n📡 授權監控的單位編號：`{codes}`\n👮 授權查詢身分組：{roleMsg}\n> *(擁有上述身分組的長官，現在可以在此頻道使用 `/admin-view` 指令查詢各單位排行榜了！)*");
                             break;
                         }
                     case "add-menu-item":

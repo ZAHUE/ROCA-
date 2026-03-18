@@ -106,6 +106,46 @@ namespace ROCAPointBot
             return (point?.EP ?? 0) + (point?.OEP ?? 0);
         }
 
+        private static int GetPointTypeValue(DepartmentPoint point, string pointType)
+        {
+            return NormalizePointType(pointType) == "OEP" ? point?.OEP ?? 0 : point?.EP ?? 0;
+        }
+
+        private static void ApplyDepartmentPointDelta(DepartmentPoint point, string pointType, int delta)
+        {
+            if (NormalizePointType(pointType) == "OEP") point.OEP = Math.Max(0, point.OEP + delta);
+            else point.EP = Math.Max(0, point.EP + delta);
+        }
+
+        private async Task<(bool exists, string? name, string? errorMessage)> GetRobloxGroupInfoAsync(string groupId)
+        {
+            if (string.IsNullOrWhiteSpace(groupId) || !long.TryParse(groupId, out _))
+            {
+                return (false, null, "❌ Roblox Group ID 格式錯誤，請輸入純數字 ID。");
+            }
+
+            try
+            {
+                var res = await _http.GetAsync($"https://groups.roblox.com/v1/groups/{groupId}");
+                if (res.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                    return (false, null, $"❌ 找不到 Roblox 群組 `{groupId}`，請確認 ID 是否正確。");
+                }
+                if (!res.IsSuccessStatusCode)
+                {
+                    return (false, null, $"❌ Roblox 群組驗證失敗 (HTTP {(int)res.StatusCode})，請稍後再試。");
+                }
+
+                using var doc = JsonDocument.Parse(await res.Content.ReadAsStringAsync());
+                string? name = doc.RootElement.TryGetProperty("name", out var nameProp) ? nameProp.GetString() : null;
+                return (true, name, null);
+            }
+            catch (Exception ex)
+            {
+                return (false, null, $"❌ 無法驗證 Roblox 群組：{ex.Message}");
+            }
+        }
+
         private async Task<UserPoint> EnsureUserPointAsync(BotDbContext db, ulong guildId, string robloxUsername)
         {
             var userPoint = await db.UserPoints.FirstOrDefaultAsync(u => u.GuildId == guildId && u.RobloxUsername.ToLower() == robloxUsername.ToLower());
@@ -482,6 +522,13 @@ namespace ROCAPointBot
                 new SlashCommandBuilder().WithName("end-event")
                     .WithDescription("⏹️ 結束活動並開啟結算面板 (自動過濾待滿5分鐘人員)")
                     .AddOption("points", ApplicationCommandOptionType.Integer, "預定發放點數", isRequired: true)
+                    .AddOption(new SlashCommandOptionBuilder()
+                        .WithName("point_type")
+                        .WithDescription("選擇此次活動要發放的點數類型")
+                        .WithType(ApplicationCommandOptionType.String)
+                        .WithRequired(false)
+                        .AddChoice("EP", "EP")
+                        .AddChoice("OEP", "OEP"))
                     // 👇 新增這行：讓長官結算時可以選填備註
                     .AddOption("note", ApplicationCommandOptionType.String, "結算備註 (選填，會附加在活動名稱後方)", isRequired: false)
                     .Build(),
@@ -489,11 +536,36 @@ namespace ROCAPointBot
                 .WithDescription("🎤 設定語音頻道進出入紀錄的自動推播頻道")
                 .AddOption("channel", ApplicationCommandOptionType.Channel, "選擇要接收紀錄的文字頻道", isRequired: true)
                 .Build(),
-                new SlashCommandBuilder().WithName("apply-points").WithDescription(" 提交點數發放申請 (需附證明連結)").Build(),
-                new SlashCommandBuilder().WithName("apply-redeem").WithDescription(" 提交點數兌換申請 (兌換 MENU 內容)").Build(),
+                new SlashCommandBuilder().WithName("apply-points")
+                .WithDescription(" 提交點數發放申請 (需附證明連結)")
+                .AddOption(new SlashCommandOptionBuilder()
+                    .WithName("point_type")
+                    .WithDescription("選擇申請的點數類型")
+                    .WithType(ApplicationCommandOptionType.String)
+                    .WithRequired(false)
+                    .AddChoice("EP", "EP")
+                    .AddChoice("OEP", "OEP"))
+                .Build(),
+                new SlashCommandBuilder().WithName("apply-redeem")
+                .WithDescription(" 提交點數兌換申請 (兌換 MENU 內容)")
+                .AddOption(new SlashCommandOptionBuilder()
+                    .WithName("point_type")
+                    .WithDescription("選擇此次兌換要扣除的點數類型")
+                    .WithType(ApplicationCommandOptionType.String)
+                    .WithRequired(false)
+                    .AddChoice("EP", "EP")
+                    .AddChoice("OEP", "OEP"))
+                .Build(),
                 new SlashCommandBuilder().WithName("batch-addpoint")
                 .WithDescription(" 批次發放點數 (支援多人同時發放)")
                 .AddOption("points", ApplicationCommandOptionType.Integer, "發放點數數量", isRequired: true)
+                .AddOption(new SlashCommandOptionBuilder()
+                    .WithName("point_type")
+                    .WithDescription("選擇此次批次發放的點數類型")
+                    .WithType(ApplicationCommandOptionType.String)
+                    .WithRequired(false)
+                    .AddChoice("EP", "EP")
+                    .AddChoice("OEP", "OEP"))
                 .AddOption("reason", ApplicationCommandOptionType.String, "活動名稱或原因", isRequired: true)
                 .AddOption("note", ApplicationCommandOptionType.String, "額外備註 (選填)", isRequired: false)
                 .Build(),
@@ -542,7 +614,13 @@ namespace ROCAPointBot
                     case "setup-roca":
                         {
                             if (!((SocketGuildUser)command.User).GuildPermissions.Administrator) { await command.FollowupAsync("❌ 限管理員執行。"); return; }
-                            string rId = (string)command.Data.Options.First(x => x.Name == "roblox_group_id").Value;
+                            string rId = ((string)command.Data.Options.First(x => x.Name == "roblox_group_id").Value).Trim();
+                            var groupInfo = await GetRobloxGroupInfoAsync(rId);
+                            if (!groupInfo.exists)
+                            {
+                                await command.FollowupAsync(groupInfo.errorMessage ?? "❌ 無法驗證 Roblox 群組。", ephemeral: true);
+                                return;
+                            }
 
                             // 👇 讀取最多七個身分組
                             var role1 = (SocketRole)command.Data.Options.FirstOrDefault(x => x.Name == "admin_role_1")?.Value;
@@ -577,7 +655,8 @@ namespace ROCAPointBot
                             }
                             await db.SaveChangesAsync();
 
-                            await command.FollowupAsync($"✅ 已綁定 Roblox 群組 `{rId}`。\n🔑 **本伺服器專屬資料庫編號：`{botConfig.ServerCode}`** (請妥善保存，交給國防部設定 Admin 頻道使用)。\n正在背景抓取群組成員，請稍候...");
+                            string verifiedGroupName = string.IsNullOrWhiteSpace(groupInfo.name) ? "未知群組" : groupInfo.name;
+                            await command.FollowupAsync($"✅ 已綁定 Roblox 群組 `{rId}`（{verifiedGroupName}）。\n🔑 **本伺服器專屬資料庫編號：`{botConfig.ServerCode}`** (請妥善保存，交給國防部設定 Admin 頻道使用)。\n正在背景抓取群組成員，請稍候...");
                             var syncResult = await SyncGroupMembersAsync(db, gid, rId);
                             await command.Channel.SendMessageAsync($"🔄 群組名單同步完成！\n> 🟢 新增了 **{syncResult.added}** 位新成員 (預設為 0 點)\n> 🔴 移除了 **{syncResult.removed}** 位已退群或不符資格成員。");
                             break;
@@ -624,6 +703,7 @@ namespace ROCAPointBot
                             }
 
                             int points = Convert.ToInt32((long)command.Data.Options.First(x => x.Name == "points").Value);
+                            string pointType = NormalizePointType(command.Data.Options.FirstOrDefault(x => x.Name == "point_type")?.Value?.ToString());
                             var noteOption = command.Data.Options.FirstOrDefault(x => x.Name == "note");
                             string finalReason = evt.Reason + (noteOption != null ? $" (備註：{noteOption.Value})" : "");
 
@@ -693,6 +773,8 @@ namespace ROCAPointBot
                             {
                                 GuildId = gid,
                                 Points = points,
+                                PointType = pointType,
+                                DepartmentKey = GetDepartmentKey(botConfig),
                                 Reason = finalReason,
                                 AdminId = exec.Id,
                                 FinalUserIds = qualifiedIds,
@@ -786,6 +868,7 @@ namespace ROCAPointBot
                             if (!IsAdmin(exec, botConfig)) { await command.FollowupAsync("❌ 權限不足。"); return; }
 
                             int pts = Convert.ToInt32((long)command.Data.Options.First(x => x.Name == "points").Value);
+                            string pointType = NormalizePointType(command.Data.Options.FirstOrDefault(x => x.Name == "point_type")?.Value?.ToString());
                             string reason = (string)command.Data.Options.First(x => x.Name == "reason").Value;
                             string note = command.Data.Options.FirstOrDefault(x => x.Name == "note")?.Value as string ?? "無";
 
@@ -795,6 +878,8 @@ namespace ROCAPointBot
                             {
                                 GuildId = gid,
                                 Points = pts,
+                                PointType = pointType,
+                                DepartmentKey = GetDepartmentKey(botConfig),
                                 Reason = $"{reason} (備註: {note})",
                                 AdminId = exec.Id
                             };
@@ -1765,9 +1850,10 @@ namespace ROCAPointBot
                         }
                     case "apply-points":
                         {
+                            string pointType = NormalizePointType(command.Data.Options.FirstOrDefault(x => x.Name == "point_type")?.Value?.ToString());
                             var modal = new ModalBuilder()
                                 .WithTitle("點數核發申請單")
-                                .WithCustomId("modal_user_apply_add")
+                                .WithCustomId($"modal_user_apply_add_{pointType}")
                                 .AddTextInput("活動、訓練名稱/值勤時數", "reason", placeholder: "例如：03/10 聯合演習", required: true)
                                 .AddTextInput("申請點數數量", "amount", placeholder: "請輸入數字 (例如: 2)", required: true)
                                 .AddTextInput("截圖證明連結", "evidence", placeholder: "請貼上 Imgur 或 Discord 截圖網址", required: true);
@@ -1776,9 +1862,10 @@ namespace ROCAPointBot
                         }
                     case "apply-redeem":
                         {
+                            string pointType = NormalizePointType(command.Data.Options.FirstOrDefault(x => x.Name == "point_type")?.Value?.ToString());
                             var modal = new ModalBuilder()
                                 .WithTitle(" 點數兌換申請單")
-                                .WithCustomId("modal_user_apply_rem")
+                                .WithCustomId($"modal_user_apply_rem_{pointType}")
                                 .AddTextInput("想兌換的名稱", "item_name", placeholder: "請參考 /menu 內的名稱", required: true)
                                 .AddTextInput("所需點數", "amount", placeholder: "請輸入該品項所需點數", required: true)
                                 .AddTextInput("備註", "note", placeholder: "選填：例如想要兌換的職位名稱", required: false, style: TextInputStyle.Paragraph);
@@ -1812,7 +1899,7 @@ namespace ROCAPointBot
             sb.AppendLine($"## 📊 語音活動結算面板 (審核中)");
             sb.AppendLine($"> **發放原因：** {pending.Reason}");
             sb.AppendLine($"> **活動總時長：** `{durationStr}`"); // 👈 顯示在面板上
-            sb.AppendLine($"> **預定點數：** `{pending.Points}` 點");
+            sb.AppendLine($"> **預定點數：** `{pending.Points} {pending.PointType}`");
             sb.AppendLine($"> **符合資格：** `{pending.FinalUserIds.Count}` 人 *(原本條件為待滿5分鐘)*\n");
 
             sb.AppendLine("👥 **【最終核定發放名單】**");
@@ -1946,6 +2033,11 @@ namespace ROCAPointBot
                         {
                             user.Points = 0;
                         }
+                        foreach (var departmentPoint in db.DepartmentPoints.Where(p => p.GuildId == gid))
+                        {
+                            departmentPoint.EP = 0;
+                            departmentPoint.OEP = 0;
+                        }
 
                         // 2. 將先前的歷史紀錄標記為已刪除
                         foreach (var log in db.PointLogs.Where(l => l.GuildId == gid))
@@ -1954,6 +2046,7 @@ namespace ROCAPointBot
                         }
 
                         await db.SaveChangesAsync();
+                        _ = UpdateGoogleSheetAsync(gid);
 
                         // 3. 更新原本的按鈕訊息
                         await component.UpdateAsync(m => {
@@ -2134,8 +2227,14 @@ namespace ROCAPointBot
                 {
                     if (!isAdmin) { await component.RespondAsync("❌ 權限不足。", ephemeral: true); return; }
                     foreach (var user in db.UserPoints.Where(u => u.GuildId == gid)) user.Points = 0;
+                    foreach (var departmentPoint in db.DepartmentPoints.Where(p => p.GuildId == gid))
+                    {
+                        departmentPoint.EP = 0;
+                        departmentPoint.OEP = 0;
+                    }
                     foreach (var log in db.PointLogs.Where(l => l.GuildId == gid)) log.IsDeleted = true;
                     await db.SaveChangesAsync();
+                    _ = UpdateGoogleSheetAsync(gid);
                     await component.UpdateAsync(m => { m.Content = $"🔥 **全體人員點數已成功歸零！**\n> (單人確認模式) 執行者：{executor.Mention}。"; m.Components = null; });
                     _ = BroadcastToAdminChannelsAsync(gid, $"🚨 **【重大操作警告：全體點數歸零】**\n> 執行者：**{executor.Username}** (單人確認模式)", true);
                     return;
@@ -2279,13 +2378,11 @@ namespace ROCAPointBot
                             continue;
                         }
 
-                        var rec = await db.UserPoints.FirstOrDefaultAsync(u => u.GuildId == gid && u.RobloxUsername.ToLower() == rName.ToLower());
-                        if (rec == null)
-                        {
-                            rec = new UserPoint { GuildId = gid, RobloxUsername = rName, Points = 0 };
-                            db.UserPoints.Add(rec);
-                        }
-                        rec.Points += pending.Points;
+                        var rec = await EnsureUserPointAsync(db, gid, rName);
+                        var departmentPoint = await GetOrCreateDepartmentPointAsync(db, gid, rName, pending.DepartmentKey ?? GetDepartmentKey(botConfig));
+                        MigrateLegacyPointsIfNeeded(rec, departmentPoint);
+                        ApplyDepartmentPointDelta(departmentPoint, pending.PointType, pending.Points);
+                        SyncLegacyUserPointTotal(rec, departmentPoint);
 
                         var newLog = new PointLog
                         {
@@ -2293,6 +2390,8 @@ namespace ROCAPointBot
                             RobloxUsername = rName,
                             AdminName = executor.Username,
                             PointsAdded = pending.Points,
+                            PointType = pending.PointType,
+                            DepartmentKey = pending.DepartmentKey ?? GetDepartmentKey(botConfig),
                             Reason = $"[批次#{sessId}] {pending.Reason}", // 註記批次編號
                             Timestamp = Program.GetTaipeiTime()
                         };
@@ -2306,13 +2405,14 @@ namespace ROCAPointBot
                     _ = UpdateGoogleSheetAsync(gid);
                     _pendingDistributions.Remove(sessId);
 
-                    string namesJoined = string.Join("、", successNames);
+                    string namesJoined = successNames.Any() ? string.Join("、", successNames) : "無";
+                    string logRangeText = logIds.Any() ? $"`{logIds.Min()} ~ {logIds.Max()}`" : "無成功紀錄";
                     string resultMsg = $"✅ **批次發放點數完成！ (編號：#{sessId})**\n" +
                                        $">  **受領人員：** {namesJoined}\n" +
-                                       $">  **每人獲得：** {pending.Points} 點\n" +
+                                       $">  **每人獲得：** {pending.Points} {pending.PointType}\n" +
                                        $">  **原因備註：** {pending.Reason}\n" +
                                        $">  **執行長官：** {executor.Username}\n" +
-                                       $">  **紀錄 ID 範圍：** `{logIds.Min()} ~ {logIds.Max()}`";
+                                       $">  **紀錄 ID 範圍：** {logRangeText}";
 
                     if (failedNames.Any()) resultMsg += $"\n⚠️ **發放失敗：** {string.Join(", ", failedNames)}";
 
@@ -2322,7 +2422,7 @@ namespace ROCAPointBot
                     _ = BroadcastToAdminChannelsAsync(gid, $"負責人 **{executor.Username}** 已執行批次發放 `#{sessId}`\n" +
                                           $"> 活動原因：**{pending.Reason}**\n" +
                                           $"> **名單：{namesJoined}**\n" +
-                                          $"> 每人獲得：**{pending.Points}** 點", pending.Points >= 100);
+                                          $"> 每人獲得：**{pending.Points} {pending.PointType}**", pending.Points >= 100);
                     return;
                 }
                 if (id.StartsWith("evcancel_"))
@@ -2358,16 +2458,14 @@ namespace ROCAPointBot
                         string rName = displayName;
                         if (rName.Contains("]")) rName = rName.Substring(rName.LastIndexOf(']') + 1).Trim();
 
-                        var rec = await db.UserPoints.FirstOrDefaultAsync(u => u.GuildId == gid && u.RobloxUsername.ToLower() == rName.ToLower());
-                        if (rec == null)
-                        {
-                            if (!await VerifyUserInRobloxGroup(rName, botConfig.RobloxGroupId)) { failedNames.Add(rName); continue; }
-                            rec = new UserPoint { GuildId = gid, RobloxUsername = rName, Points = 0 };
-                            db.UserPoints.Add(rec);
-                        }
+                        if (!await VerifyUserInRobloxGroup(rName, botConfig.RobloxGroupId)) { failedNames.Add(rName); continue; }
 
-                        rec.Points += pending.Points;
-                        db.PointLogs.Add(new PointLog { GuildId = gid, RobloxUsername = rName, AdminName = executor.Username, PointsAdded = pending.Points, Reason = pending.Reason, Timestamp = Program.GetTaipeiTime() });
+                        var rec = await EnsureUserPointAsync(db, gid, rName);
+                        var departmentPoint = await GetOrCreateDepartmentPointAsync(db, gid, rName, pending.DepartmentKey ?? GetDepartmentKey(botConfig));
+                        MigrateLegacyPointsIfNeeded(rec, departmentPoint);
+                        ApplyDepartmentPointDelta(departmentPoint, pending.PointType, pending.Points);
+                        SyncLegacyUserPointTotal(rec, departmentPoint);
+                        db.PointLogs.Add(new PointLog { GuildId = gid, RobloxUsername = rName, AdminName = executor.Username, PointsAdded = pending.Points, PointType = pending.PointType, DepartmentKey = pending.DepartmentKey ?? GetDepartmentKey(botConfig), Reason = pending.Reason, Timestamp = Program.GetTaipeiTime() });
                         successCount++;
                     }
 
@@ -2388,7 +2486,7 @@ namespace ROCAPointBot
                     string resultMsg = $"✅ **語音活動點數發放完成！**\n" +
                                        $">  **參與人數：** {successCount} 人\n" +
                                        $">  **參與人員：** {namesJoined}\n" + // 顯示純文字名單
-                                       $">  **每人獲得：** {pending.Points} 點\n" +
+                                       $">  **每人獲得：** {pending.Points} {pending.PointType}\n" +
                                        $">  **活動名稱：** {pending.Reason}\n" +
                                        $">  **活動總時長：** {durationStr}\n" +
                                        $">  **登記長官：** {adminName}"; // 改為純文字
@@ -2404,7 +2502,7 @@ namespace ROCAPointBot
                                           $">  總時長：**{durationStr}**\n" +
                                           $">  參與人數：**{successCount}** 人\n" +
                                           $">  **人員名單：{namesJoined}**\n" + // 推播訊息同步顯示純文字名單
-                                          $">  每人獲得：**{pending.Points}** 點";
+                                          $">  每人獲得：**{pending.Points} {pending.PointType}**";
 
                     _ = BroadcastToAdminChannelsAsync(gid, broadcastMsg, isAnomaly);
                     return;
@@ -2455,14 +2553,17 @@ namespace ROCAPointBot
 
                 var app = new PendingApplication { GuildId = gid, ApplicantId = modal.User.Id };
 
-                if (modal.Data.CustomId == "modal_user_apply_add")
+                app.PointType = NormalizePointType(modal.Data.CustomId.Split('_').LastOrDefault());
+                app.DepartmentKey = GetDepartmentKey(config);
+
+                if (modal.Data.CustomId.StartsWith("modal_user_apply_add"))
                 {
                     app.Type = "發放";
                     app.Reason = modal.Data.Components.First(x => x.CustomId == "reason").Value;
                     app.Amount = int.TryParse(modal.Data.Components.First(x => x.CustomId == "amount").Value, out var a) ? a : 0;
                     app.Evidence = modal.Data.Components.First(x => x.CustomId == "evidence").Value;
                 }
-                else if (modal.Data.CustomId == "modal_user_apply_rem")
+                else if (modal.Data.CustomId.StartsWith("modal_user_apply_rem"))
                 {
                     app.Type = "兌換";
                     app.Reason = modal.Data.Components.First(x => x.CustomId == "item_name").Value;
@@ -2479,7 +2580,7 @@ namespace ROCAPointBot
                     .WithColor(app.Type == "發放" ? Discord.Color.Green : Discord.Color.Orange)
                     .AddField("申請類型", app.Type, true)
                     .AddField("申請人", modal.User.Mention, true)
-                    .AddField("金額", $"{app.Amount} 點", true)
+                    .AddField("金額", $"{app.Amount} {app.PointType}", true)
                     .AddField("事由/品項", app.Reason)
                     .WithFooter($"申請時間: {Program.GetTaipeiTime():yyyy-MM-dd HH:mm:ss}");
 
@@ -2535,7 +2636,9 @@ namespace ROCAPointBot
             string name = applicant?.Nickname ?? applicant?.Username ?? "未知";
             if (name.Contains("]")) name = name.Substring(name.LastIndexOf(']') + 1).Trim();
 
-            var userPoint = await db.UserPoints.FirstOrDefaultAsync(u => u.GuildId == app.GuildId && u.RobloxUsername.ToLower() == name.ToLower());
+            var userPoint = await EnsureUserPointAsync(db, app.GuildId, name);
+            var departmentPoint = await GetOrCreateDepartmentPointAsync(db, app.GuildId, name, app.DepartmentKey ?? GetDepartmentKey(botConfig));
+            MigrateLegacyPointsIfNeeded(userPoint, departmentPoint);
 
             if (applicant == null)
             {
@@ -2544,14 +2647,17 @@ namespace ROCAPointBot
             }
 
             // 如果是兌換，檢查點數是否足夠
-            if (app.Type == "兌換" && userPoint.Points < app.Amount)
+            string pointType = NormalizePointType(app.PointType);
+            int availablePoints = GetPointTypeValue(departmentPoint, pointType);
+            if (app.Type == "兌換" && availablePoints < app.Amount)
             {
-                await component.RespondAsync($"❌ 申請人點數不足（現有 {userPoint.Points} 點），無法核准兌換。", ephemeral: true);
+                await component.RespondAsync($"❌ 申請人 {pointType} 不足（現有 {availablePoints} 點），無法核准兌換。", ephemeral: true);
                 return;
             }
 
             int change = app.Type == "發放" ? app.Amount : -app.Amount;
-            userPoint.Points += change;
+            ApplyDepartmentPointDelta(departmentPoint, pointType, change);
+            SyncLegacyUserPointTotal(userPoint, departmentPoint);
 
             var log = new PointLog
             {
@@ -2559,6 +2665,8 @@ namespace ROCAPointBot
                 RobloxUsername = name,
                 AdminName = $"系統審核({component.User.Username})",
                 PointsAdded = change,
+                PointType = pointType,
+                DepartmentKey = app.DepartmentKey ?? GetDepartmentKey(botConfig),
                 Reason = $"[申請核准] {app.Reason}",
                 Timestamp = Program.GetTaipeiTime()
             };
@@ -2567,12 +2675,12 @@ namespace ROCAPointBot
             _ = UpdateGoogleSheetAsync(app.GuildId);
 
             await component.UpdateAsync(m => {
-                m.Content = $"✅ **申請已核准**\n> 審核人：{component.User.Mention}\n> 申請人：{applicant?.Mention} ({name})\n> 變動：{change} 點 (目前: {userPoint.Points})\n> 原因：{app.Reason}";
+                m.Content = $"✅ **申請已核准**\n> 審核人：{component.User.Mention}\n> 申請人：{applicant?.Mention} ({name})\n> 變動：{change} {pointType} (目前 {pointType}: {GetPointTypeValue(departmentPoint, pointType)} / 合計: {GetDepartmentTotal(departmentPoint)})\n> 原因：{app.Reason}";
                 m.Embeds = null; m.Components = null;
             });
 
             // 推播給國防部
-            _ = BroadcastToAdminChannelsAsync(app.GuildId, $"已核准 **{name}** 的申請\n> 動作：{app.Type} {app.Amount} 點\n> 原因：{app.Reason}\n> 紀錄編號：#{log.Id}", Math.Abs(change) >= 100);
+            _ = BroadcastToAdminChannelsAsync(app.GuildId, $"已核准 **{name}** 的申請\n> 動作：{app.Type} {app.Amount} {pointType}\n> 原因：{app.Reason}\n> 紀錄編號：#{log.Id}", Math.Abs(change) >= 100);
 
             _pendingApplications.Remove(appId);
         }
@@ -2920,21 +3028,31 @@ namespace ROCAPointBot
                         break;
                 }
 
-                // 從資料庫抓取最新的排行榜資料
-                var users = await db.UserPoints.Where(u => u.GuildId == guildId).OrderByDescending(u => u.Points).ToListAsync();
+                string departmentKey = GetDepartmentKey(config);
+                var users = await db.UserPoints.Where(u => u.GuildId == guildId).ToListAsync();
+                var departmentPoints = await db.DepartmentPoints.Where(p => p.GuildId == guildId && p.DepartmentKey == departmentKey).ToListAsync();
+                var departmentDict = departmentPoints.ToDictionary(p => p.RobloxUsername.ToLower(), p => p);
 
-                // 準備要寫入 Google 試算表的資料結構 (3個欄位)
+                var rankedUsers = users
+                    .Select(u => new
+                    {
+                        User = u,
+                        DepartmentPoint = departmentDict.TryGetValue(u.RobloxUsername.ToLower(), out var dp) ? dp : new DepartmentPoint { GuildId = guildId, RobloxUsername = u.RobloxUsername, DepartmentKey = departmentKey, EP = 0, OEP = 0 }
+                    })
+                    .OrderByDescending(x => GetDepartmentTotal(x.DepartmentPoint))
+                    .ThenBy(x => x.User.RobloxUsername)
+                    .ToList();
+
                 var valueRange = new ValueRange();
                 var oblist = new List<IList<object>>()
                 {
-                    new List<object>() { "職位", "人員名稱", "目前點數", "最後變動時間" } // 👈 加入職位表頭
+                    new List<object>() { "職位", "人員名稱", "EP", "OEP", "部門總分", "最後變動時間" }
                 };
 
                 string updateTime = Program.GetTaipeiTime().ToString("yyyy-MM-dd HH:mm:ss");
-                foreach (var u in users)
+                foreach (var row in rankedUsers)
                 {
-                    // 寫入四欄資料：職位 (若空則顯示未知)、名稱、點數、時間
-                    oblist.Add(new List<object>() { u.RobloxRank ?? "尚未同步", u.RobloxUsername, u.Points, updateTime });
+                    oblist.Add(new List<object>() { row.User.RobloxRank ?? "尚未同步", row.User.RobloxUsername, row.DepartmentPoint.EP, row.DepartmentPoint.OEP, GetDepartmentTotal(row.DepartmentPoint), updateTime });
                 }
                 valueRange.Values = oblist;
 
@@ -2954,8 +3072,8 @@ namespace ROCAPointBot
                 // 🟢 動作 1：更新該單位的「專屬試算表」
                 if (!string.IsNullOrEmpty(individualSheetId))
                 {
-                    // 改為清空 A 到 D 欄
-                    await service.Spreadsheets.Values.Clear(new ClearValuesRequest(), individualSheetId, "A:D").ExecuteAsync();
+                    // 改為清空 A 到 F 欄
+                    await service.Spreadsheets.Values.Clear(new ClearValuesRequest(), individualSheetId, "A:F").ExecuteAsync();
                     var updateRequest = service.Spreadsheets.Values.Update(valueRange, individualSheetId, "A1");
                     updateRequest.ValueInputOption = SpreadsheetsResource.ValuesResource.UpdateRequest.ValueInputOptionEnum.USERENTERED;
                     await updateRequest.ExecuteAsync();
@@ -2964,8 +3082,8 @@ namespace ROCAPointBot
                 // 🟢 動作 2：同步更新「三單位總覽試算表」的對應分頁
                 if (!string.IsNullOrEmpty(tabName))
                 {
-                    // 指定範圍改為 A:D
-                    string range = $"{tabName}!A:D";
+                    // 指定範圍改為 A:F
+                    string range = $"{tabName}!A:F";
                     await service.Spreadsheets.Values.Clear(new ClearValuesRequest(), combinedSheetId, range).ExecuteAsync();
 
                     var updateCombinedReq = service.Spreadsheets.Values.Update(valueRange, combinedSheetId, $"{tabName}!A1");
@@ -3076,6 +3194,8 @@ namespace ROCAPointBot
     {
         public ulong GuildId { get; set; }
         public int Points { get; set; }
+        public string PointType { get; set; } = "EP";
+        public string? DepartmentKey { get; set; }
         public string Reason { get; set; }
         public ulong AdminId { get; set; }
         public HashSet<ulong> FinalUserIds { get; set; } = new();
@@ -3100,6 +3220,8 @@ namespace ROCAPointBot
         public string Type { get; set; } // 發放 或 兌換
         public string Reason { get; set; }
         public int Amount { get; set; }
+        public string PointType { get; set; } = "EP";
+        public string? DepartmentKey { get; set; }
         public string? Evidence { get; set; } // 僅發放有
         public string? Note { get; set; }     // 僅兌換有
     }
